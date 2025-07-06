@@ -397,7 +397,7 @@ public partial class StreamService
         if (type == StreamType.CatchUp)
         {
             string? startString = start?.ToString("yyyy'-'MM'-'dd':'HH'-'mm", CultureInfo.InvariantCulture);
-            uri = $"{config.BaseUrl}/timeshift/username={config.Username}/password={config.Password}/duration={durationMinutes}/start={startString}/stream={id}";
+            uri = $"{config.BaseUrl}/timeshift/{config.Username}/{config.Password}/{durationMinutes}/{startString}/{id}";
         }
 
         bool isLive = type == StreamType.Live;
