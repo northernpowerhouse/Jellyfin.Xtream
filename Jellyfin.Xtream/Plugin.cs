@@ -16,12 +16,17 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
+using System.Net.Http;
 using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
 using Jellyfin.Xtream.Client;
 using Jellyfin.Xtream.Configuration;
 using Jellyfin.Xtream.Service;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Plugins;
+using MediaBrowser.Controller;
 using MediaBrowser.Model.Plugins;
 using MediaBrowser.Model.Serialization;
 using MediaBrowser.Model.Tasks;
@@ -44,20 +49,47 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
     /// <param name="xmlSerializer">Instance of the <see cref="IXmlSerializer"/> interface.</param>
     /// <param name="taskManager">Instance of the <see cref="ITaskManager"/> interface.</param>
     /// <param name="xtreamClient">Instance of the <see cref="IXtreamClient"/> interface.</param>
+    /// <param name="restreamManager">Optional <see cref="Service.RestreamManager"/> used to ensure server-local proxied streams for restreaming.</param>
     /// <param name="logger">Instance of the <see cref="ILogger{Plugin}"/> interface.</param>
+    /// <param name="loggerFactory">Instance of the <see cref="ILoggerFactory"/> used to create loggers for internal services.</param>
     public Plugin(
         IApplicationPaths applicationPaths,
         IXmlSerializer xmlSerializer,
         ITaskManager taskManager,
         IXtreamClient xtreamClient,
-        ILogger<Plugin> logger)
+        Service.RestreamManager? restreamManager,
+        Microsoft.Extensions.Logging.ILogger<Plugin> logger,
+        Microsoft.Extensions.Logging.ILoggerFactory loggerFactory)
         : base(applicationPaths, xmlSerializer)
     {
         _instance = this;
         _logger = logger;
-        StreamService = new(xtreamClient);
+        // Create a logger for StreamService via the logger factory and pass it in so StreamService
+        // can log the final MediaSourceInfo that the plugin returns to Jellyfin.
+        var ssLogger = loggerFactory.CreateLogger<Jellyfin.Xtream.Service.StreamService>();
+        StreamService = new(xtreamClient, restreamManager, ssLogger);
+        // Store the xtream client and restream manager for background pre-provisioning.
+        XtreamClient = xtreamClient;
+        RestreamManager = restreamManager;
+        // Kick off a background pre-provision of recent catchup items so server-local
+        // restreams exist early (reduces race at PlaybackInfo time).
+        if (RestreamManager != null)
+        {
+            _ = Task.Run(async () => await PreProvisionRecentCatchupAsync().ConfigureAwait(false));
+        }
+
         TaskService = new(taskManager);
     }
+
+    /// <summary>
+    /// Gets the optional Xtream client used for background tasks.
+    /// </summary>
+    public IXtreamClient? XtreamClient { get; init; }
+
+    /// <summary>
+    /// Gets the optional restream manager used to ensure restreams.
+    /// </summary>
+    public Service.RestreamManager? RestreamManager { get; init; }
 
     /// <inheritdoc />
     public override string Name => "Jellyfin Xtream";
@@ -148,5 +180,57 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
         TaskService.CancelIfRunningAndQueue(
             "Jellyfin.LiveTv",
             "Jellyfin.LiveTv.Channels.RefreshChannelsScheduledTask");
+    }
+
+    private async Task PreProvisionRecentCatchupAsync()
+    {
+        try
+        {
+            if (XtreamClient == null || RestreamManager == null)
+            {
+                return;
+            }
+
+            // Get live streams and pre-provision for channels that support TV archive.
+            var streams = await StreamService.GetLiveStreamsWithOverrides(CancellationToken.None).ConfigureAwait(false);
+            DateTime cutoff = DateTime.UtcNow.AddDays(-2); // limit to recent 2 days
+            foreach (var s in streams)
+            {
+                try
+                {
+                    if (!s.TvArchive)
+                    {
+                        continue;
+                    }
+
+                    // Get EPG listings for the channel and ensure restreams for recent items.
+                    var epgs = await XtreamClient.GetEpgInfoAsync(Creds, s.StreamId, CancellationToken.None).ConfigureAwait(false);
+                    foreach (var epg in epgs.Listings.Where(e => e.Start >= cutoff))
+                    {
+                        try
+                        {
+                            int durationMinutes = (int)Math.Ceiling((epg.End - epg.Start).TotalMinutes);
+                            var msi = StreamService.GetMediaSourceInfo(StreamType.CatchUp, s.StreamId, start: epg.StartLocalTime, durationMinutes: durationMinutes, restream: true);
+                            // EnsureRestream will register and attempt to open the restream.
+                            RestreamManager.EnsureRestream(msi);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to pre-provision restream for channel {Channel} epg {Epg}", s.StreamId, epg.Id);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to pre-provision catchup for channel {Channel}", s.StreamId);
+                }
+            }
+
+            // Pre-provisioning complete
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unexpected error during pre-provisioning of catchup restreams");
+        }
     }
 }

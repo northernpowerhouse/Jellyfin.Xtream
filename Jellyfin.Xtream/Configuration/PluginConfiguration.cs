@@ -45,6 +45,13 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool IsCatchupVisible { get; set; }
 
     /// <summary>
+    /// Gets or sets a value indicating whether catchup items should be forced to direct play / proxied
+    /// server-local streams. When enabled, the plugin will attempt to replace upstream catchup
+    /// MediaSource URLs with server-local LiveStreamFiles URLs so clients stream from the server.
+    /// </summary>
+    public bool ForceDirectPlayCatchup { get; set; } = false;
+
+    /// <summary>
     /// Gets or sets a value indicating whether the Series channel is visible.
     /// </summary>
     public bool IsSeriesVisible { get; set; }

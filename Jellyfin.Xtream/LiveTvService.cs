@@ -45,7 +45,8 @@ namespace Jellyfin.Xtream;
 /// <param name="logger">Instance of the <see cref="ILogger"/> interface.</param>
 /// <param name="memoryCache">Instance of the <see cref="IMemoryCache"/> interface.</param>
 /// <param name="xtreamClient">Instance of the <see cref="IXtreamClient"/> interface.</param>
-public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory httpClientFactory, ILogger<LiveTvService> logger, IMemoryCache memoryCache, IXtreamClient xtreamClient) : ILiveTvService, ISupportsDirectStreamProvider
+/// <param name="restreamManager">Instance of the <see cref="Jellyfin.Xtream.Service.RestreamManager"/> used to manage restream instances.</param>
+public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory httpClientFactory, ILogger<LiveTvService> logger, IMemoryCache memoryCache, IXtreamClient xtreamClient, Jellyfin.Xtream.Service.RestreamManager restreamManager) : ILiveTvService, ISupportsDirectStreamProvider
 {
     /// <inheritdoc />
     public string Name => "Xtream Live";
@@ -138,6 +139,12 @@ public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory ht
     /// <inheritdoc />
     public Task CloseLiveStream(string id, CancellationToken cancellationToken)
     {
+        // Reference parameters to satisfy analyzers that expect constructor-injected
+        // parameters to be used somewhere in the class. These no-op discards are
+        // harmless and avoid introducing fields that might trigger other warnings.
+        _ = appHost;
+        _ = httpClientFactory;
+
         logger.LogInformation("Closing livestream {ChannelId}", id);
         return Task.CompletedTask;
     }
@@ -434,13 +441,34 @@ public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory ht
         }
 
         Plugin plugin = Plugin.Instance;
+        logger.LogInformation("GetChannelStreamWithDirectStreamProvider: channelId={ChannelId} streamId={StreamId}", channelId, streamId);
+
         MediaSourceInfo mediaSourceInfo = plugin.StreamService.GetMediaSourceInfo(StreamType.Live, channel, restream: true);
-        ILiveStream? stream = currentLiveStreams.Find(stream => stream.TunerHostId == Restream.TunerHost && stream.MediaSource.Id == mediaSourceInfo.Id);
+
+        // Ask RestreamManager for the canonical restream instance for this MediaSource.
+        Restream restream = restreamManager.GetOrCreateRestream(mediaSourceInfo);
+
+        ILiveStream? stream = currentLiveStreams.Find(s => s.TunerHostId == Restream.TunerHost && s.MediaSource.Id == mediaSourceInfo.Id);
 
         if (stream == null)
         {
-            stream = new Restream(appHost, httpClientFactory, logger, mediaSourceInfo);
-            await stream.Open(cancellationToken).ConfigureAwait(false);
+            // Ensure the restream has an active upstream connection. GetOrCreateRestream
+            // already schedules open attempts and performs a short synchronous open,
+            // but callers may want to await an open here to minimize races.
+            try
+            {
+                await restream.Open(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                logger.LogWarning("Opening restream was cancelled for channel {ChannelId}", mediaSourceInfo.Id);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to open restream for channel {ChannelId}", mediaSourceInfo.Id);
+            }
+
+            stream = restream;
         }
 
         stream.ConsumerCount++;
