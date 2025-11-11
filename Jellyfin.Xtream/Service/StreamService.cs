@@ -34,8 +34,14 @@ namespace Jellyfin.Xtream.Service;
 /// A service for dealing with stream information.
 /// </summary>
 /// <param name="xtreamClient">Instance of the <see cref="IXtreamClient"/> interface.</param>
-public partial class StreamService(IXtreamClient xtreamClient)
+/// <param name="restreamManager">Optional <see cref="RestreamManager"/> used to create server-local restreams when requested.</param>
+/// <param name="logger">Logger used by the service for internal diagnostic messages.</param>
+public partial class StreamService(IXtreamClient xtreamClient, RestreamManager? restreamManager, Microsoft.Extensions.Logging.ILogger<Jellyfin.Xtream.Service.StreamService> logger)
 {
+    #pragma warning disable CA1823 // Unused fields are intentionally accepted for constructor compatibility
+    private readonly RestreamManager? _restreamManager = restreamManager;
+    private readonly Microsoft.Extensions.Logging.ILogger<Jellyfin.Xtream.Service.StreamService> _logger = logger;
+    #pragma warning restore CA1823
     /// <summary>
     /// The id prefix for VOD category channel items.
     /// </summary>

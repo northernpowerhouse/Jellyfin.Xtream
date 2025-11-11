@@ -1,5 +1,15 @@
 <div id="XtreamLivePage" data-role="page" class="page type-interior pluginConfigurationPage withTabs"
   data-require="emby-input,emby-button" data-controller="__plugin/XtreamLive.js">
+  <div class="pageTabContent">
+    <div class="tabLinks">
+      <a href="configurationpage?name=XtreamCredentials.html">Credentials</a>
+      <a href="configurationpage?name=XtreamLive.html" class="selected">Live TV</a>
+      <a href="configurationpage?name=XtreamLiveOverrides.html">TV Overrides</a>
+      <a href="configurationpage?name=XtreamVod.html">Video On-Demand</a>
+      <a href="configurationpage?name=XtreamSeries.html">Series</a>
+      <a href="configurationpage?name=XtreamXmlTv.html">XMLTV</a>
+    </div>
+  </div>
   <div data-role="content">
     <div class="content-primary">
       <form id="XtreamLiveForm">
@@ -7,6 +17,12 @@
           <label>
             <input is="emby-checkbox" id="Visible" name="Visible" type="checkbox" />
             <span>Show the catch-up channel to users</span>
+          </label>
+        </div>
+        <div class="checkboxContainer checkboxContainer-withDescription">
+          <label>
+            <input is="emby-checkbox" id="ForceDirectPlayCatchup" name="ForceDirectPlayCatchup" type="checkbox" />
+            <span>Force direct play of catchup</span>
           </label>
         </div>
         <div class="sectionTitleContainer flex align-items-center">

@@ -181,6 +181,15 @@ const fetchJson = (url) => ApiClient.fetch({
   url: ApiClient.getUrl(url),
 });
 
+const logConfigurationChange = (pageName) => {
+  ApiClient.fetch({
+    type: 'POST',
+    url: ApiClient.getUrl('Xtream/LogConfigChange'),
+    data: JSON.stringify({ page: pageName }),
+    contentType: 'application/json'
+  });
+};
+
 const filter = (obj, predicate) => Object.keys(obj)
   .filter(key => predicate(obj[key]))
   .reduce((res, key) => (res[key] = obj[key], res), {});
@@ -206,6 +215,10 @@ const tabs = [
     href: tab('XtreamSeries'),
     name: 'Series',
   },
+  {
+    href: tab('XtreamXmlTv'),
+    name: 'XMLTV',
+  },
 ];
 
 const setTabs = (index) => {
@@ -217,10 +230,16 @@ const pluginConfig = {
   UniqueId: '5d774c35-8567-46d3-a950-9bb8227a0c5d'
 };
 
-export default {
+const Xtream = {
   fetchJson,
   filter,
   pluginConfig,
   populateCategoriesTable,
   setTabs,
-}
+  logConfigurationChange,
+};
+
+// Expose to global scope for traditional script loading
+window.Xtream = Xtream;
+
+export default Xtream;

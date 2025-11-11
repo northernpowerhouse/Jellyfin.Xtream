@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+using System.Net.Http;
 using Jellyfin.Xtream.Client;
 using Jellyfin.Xtream.Providers;
 using MediaBrowser.Controller;
@@ -20,7 +21,9 @@ using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.LiveTv;
 using MediaBrowser.Controller.Plugins;
 using MediaBrowser.Controller.Providers;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Xtream;
 
@@ -30,11 +33,36 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
     /// <inheritdoc />
     public void RegisterServices(IServiceCollection serviceCollection, IServerApplicationHost applicationHost)
     {
+        // Core services
         serviceCollection.AddSingleton<IXtreamClient, XtreamClient>();
         serviceCollection.AddSingleton<ILiveTvService, LiveTvService>();
+
+        // API Controllers
+        serviceCollection.AddScoped<Api.XtreamController>();
+
+        // Channels
         serviceCollection.AddSingleton<IChannel, CatchupChannel>();
         serviceCollection.AddSingleton<IChannel, SeriesChannel>();
         serviceCollection.AddSingleton<IChannel, VodChannel>();
+
+        // Providers
         serviceCollection.AddSingleton<IPreRefreshProvider, XtreamVodProvider>();
+
+        // Restream manager - manages server-local restream instances for proxied playback
+        serviceCollection.AddSingleton<Service.RestreamManager>(sp =>
+        {
+            var httpFactory = sp.GetRequiredService<IHttpClientFactory>();
+            var logger = sp.GetRequiredService<ILogger<Service.RestreamManager>>();
+            return new Service.RestreamManager(applicationHost, httpFactory, logger);
+        });
+
+        // Register the PlaybackInfo result filter and configure MVC to use it so we can
+        // replace PlaybackInfo MediaSource paths with server-local restream URLs.
+        serviceCollection.AddScoped<Service.PlaybackInfoFilter>();
+        serviceCollection.Configure<MvcOptions>(opts =>
+        {
+            // Use ServiceFilter so the filter is created via DI and can receive RestreamManager
+            opts.Filters.Add(new ServiceFilterAttribute(typeof(Service.PlaybackInfoFilter)));
+        });
     }
 }

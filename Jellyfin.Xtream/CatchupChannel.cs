@@ -22,6 +22,7 @@ using System.Threading.Tasks;
 using Jellyfin.Xtream.Client;
 using Jellyfin.Xtream.Client.Models;
 using Jellyfin.Xtream.Service;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Channels;
@@ -36,9 +37,11 @@ namespace Jellyfin.Xtream;
 /// </summary>
 /// <param name="logger">Instance of the <see cref="ILogger"/> interface.</param>
 /// <param name="xtreamClient">Instance of the <see cref="IXtreamClient"/> interface.</param>
-public class CatchupChannel(ILogger<CatchupChannel> logger, IXtreamClient xtreamClient) : IChannel, IDisableMediaSourceDisplay
+/// <param name="restreamManager">Instance of the <see cref="Service.RestreamManager"/> interface.</param>
+public class CatchupChannel(ILogger<CatchupChannel> logger, IXtreamClient xtreamClient, Service.RestreamManager restreamManager) : IChannel, IDisableMediaSourceDisplay
 {
     private readonly ILogger<CatchupChannel> _logger = logger;
+    private readonly Service.RestreamManager _restreamManager = restreamManager;
 
     /// <inheritdoc />
     public string? Name => "Xtream Catch-up";
@@ -191,6 +194,19 @@ public class CatchupChannel(ILogger<CatchupChannel> logger, IXtreamClient xtream
         if (epgs.Listings.Count == 0)
         {
             int durationMinutes = 24 * 60;
+
+            var msi = plugin.StreamService.GetMediaSourceInfo(StreamType.CatchUp, channelId, start: start, durationMinutes: durationMinutes, restream: true);
+            try
+            {
+                // Ensure a restream is created and started via the RestreamManager. This will modify
+                // the media source Path to a server-local proxied URL when possible.
+                _restreamManager?.EnsureRestream(msi);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to ensure restream for catchup fallback");
+            }
+
             return new()
             {
                 Items = new List<ChannelItemInfo>()
@@ -200,9 +216,7 @@ public class CatchupChannel(ILogger<CatchupChannel> logger, IXtreamClient xtream
                             ContentType = ChannelMediaContentType.TvExtra,
                             Id = StreamService.ToGuid(StreamService.CatchupStreamPrefix, channelId, 0, day).ToString(),
                             IsLiveStream = false,
-                            MediaSources = [
-                                plugin.StreamService.GetMediaSourceInfo(StreamType.CatchUp, channelId, start: start, durationMinutes: durationMinutes)
-                            ],
+                            MediaSources = [msi],
                             MediaType = ChannelMediaType.Video,
                             Name = $"No EPG available",
                             RunTimeTicks = durationMinutes * TimeSpan.TicksPerMinute,
@@ -218,9 +232,19 @@ public class CatchupChannel(ILogger<CatchupChannel> logger, IXtreamClient xtream
             ParsedName parsedName = StreamService.ParseName(epg.Title);
             int durationMinutes = (int)Math.Ceiling((epg.End - epg.Start).TotalMinutes);
             string dateTitle = epg.Start.ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture);
-            List<MediaSourceInfo> sources = [
-                plugin.StreamService.GetMediaSourceInfo(StreamType.CatchUp, channelId, start: epg.StartLocalTime, durationMinutes: durationMinutes)
-            ];
+            List<MediaSourceInfo> sources = new List<MediaSourceInfo>
+            {
+                plugin.StreamService.GetMediaSourceInfo(StreamType.CatchUp, channelId, start: epg.StartLocalTime, durationMinutes: durationMinutes, restream: true)
+            };
+
+            try
+            {
+                _restreamManager?.EnsureRestream(sources[0]);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to ensure restream for catchup item");
+            }
 
             items.Add(new()
             {

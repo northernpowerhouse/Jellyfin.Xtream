@@ -45,6 +45,13 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool IsCatchupVisible { get; set; }
 
     /// <summary>
+    /// Gets or sets a value indicating whether catchup items should be forced to direct play / proxied
+    /// server-local streams. When enabled, the plugin will attempt to replace upstream catchup
+    /// MediaSource URLs with server-local LiveStreamFiles URLs so clients stream from the server.
+    /// </summary>
+    public bool ForceDirectPlayCatchup { get; set; } = false;
+
+    /// <summary>
     /// Gets or sets a value indicating whether the Series channel is visible.
     /// </summary>
     public bool IsSeriesVisible { get; set; }
@@ -83,5 +90,40 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Gets or sets the channel override configuration for Live TV.
     /// </summary>
     public SerializableDictionary<int, ChannelOverrides> LiveTvOverrides { get; set; } = [];
+
+    /// <summary>
+    /// Gets or sets a value indicating whether to use a single XMLTV endpoint instead of per-channel EPG API calls.
+    /// </summary>
+    public bool UseXmlTv { get; set; } = false;
+
+    /// <summary>
+    /// Gets or sets the XMLTV URL. If empty the client will use the default path '/xmltv.php?username=...&amp;password=...'.
+    /// </summary>
+    public string XmlTvUrl { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the cache duration (in minutes) for the downloaded XMLTV file stored in memory.
+    /// </summary>
+    public int XmlTvCacheMinutes { get; set; } = 10;
+
+    /// <summary>
+    /// Gets or sets the number of days of historical EPG data to fetch. If 0 or negative, will use the maximum archive duration of all channels.
+    /// </summary>
+    public int XmlTvHistoricalDays { get; set; } = 0;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether to append time range parameters to XMLTV URL (timeshift=1&amp;from=...&amp;to=...).
+    /// </summary>
+    public bool XmlTvSupportsTimeshift { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether to cache the XMLTV file to disk.
+    /// </summary>
+    public bool XmlTvDiskCache { get; set; } = false;
+
+    /// <summary>
+    /// Gets or sets the path where the XMLTV cache file will be stored. If empty, uses the plugin's data directory.
+    /// </summary>
+    public string XmlTvCachePath { get; set; } = string.Empty;
 }
 #pragma warning restore CA2227

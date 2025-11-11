@@ -10,7 +10,13 @@ export default function (view) {
 
     const getConfig = ApiClient.getPluginConfiguration(pluginId);
     const visible = view.querySelector("#Visible");
-    getConfig.then((config) => visible.checked = config.IsCatchupVisible);
+    const forceDirect = view.querySelector("#ForceDirectPlayCatchup");
+    getConfig.then((config) => {
+      visible.checked = config.IsCatchupVisible;
+      if (forceDirect) {
+        forceDirect.checked = !!config.ForceDirectPlayCatchup;
+      }
+    });
     const table = view.querySelector('#LiveContent');
     Xtream.populateCategoriesTable(
       table,
@@ -23,6 +29,9 @@ export default function (view) {
 
         ApiClient.getPluginConfiguration(pluginId).then((config) => {
           config.IsCatchupVisible = visible.checked;
+          if (forceDirect) {
+            config.ForceDirectPlayCatchup = forceDirect.checked;
+          }
           config.LiveTv = data;
           ApiClient.updatePluginConfiguration(pluginId, config).then((result) => {
             Dashboard.processPluginConfigurationUpdateResult(result);

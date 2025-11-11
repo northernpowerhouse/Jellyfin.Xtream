@@ -39,12 +39,13 @@ public class Restream : ILiveStream, IDirectStreamProvider, IDisposable
     /// </summary>
     public const string TunerHost = "Xtream-Restream";
 
-    private static readonly HttpStatusCode[] _redirects = [
+    private static readonly HttpStatusCode[] _redirects = new[]
+    {
         HttpStatusCode.Moved,
         HttpStatusCode.MovedPermanently,
         HttpStatusCode.PermanentRedirect,
         HttpStatusCode.Redirect,
-    ];
+    };
 
     private readonly WrappedBufferStream _buffer;
     private readonly IHttpClientFactory _httpClientFactory;
@@ -79,6 +80,57 @@ public class Restream : ILiveStream, IDirectStreamProvider, IDisposable
         MediaSource.Path = appHost.GetSmartApiUrl(IPAddress.Any) + path;
         MediaSource.EncoderPath = appHost.GetApiUrlForLocalAccess() + path;
         MediaSource.Protocol = MediaProtocol.Http;
+        // Ensure Jellyfin treats this as a local direct-playable live stream and
+        // avoid advertising transcoding capabilities so the server will not
+        // attempt to transcode (important for HDR preservation).
+        try
+        {
+            MediaSource.SupportsDirectPlay = true;
+            MediaSource.SupportsDirectStream = true;
+            MediaSource.SupportsTranscoding = false;
+            MediaSource.UseMostCompatibleTranscodingProfile = false;
+            MediaSource.SupportsProbing = true;
+        }
+        catch
+        {
+            // Best-effort: if properties aren't present on older DTOs, ignore.
+    }
+
+    // Mark this MediaSource as server-local so Jellyfin treats it as a local
+        // stream rather than an external remote URL. Also indicate that the
+        // stream requires opening so the server may open it via the live stream
+        // plumbing when requested.
+        try
+        {
+            MediaSource.IsRemote = false;
+        }
+        catch
+        {
+            // Some older MediaSourceInfo implementations may not expose IsRemote
+            // publicly; this is best-effort and should not break initialization.
+        }
+
+        try
+        {
+            MediaSource.RequiresOpening = true;
+        }
+        catch
+        {
+            // Best-effort: if the property doesn't exist, ignore.
+        }
+
+        // Prefer to set a LiveStreamId so Jellyfin can identify this as a live stream
+        // coming from the plugin and avoid resolving an external upstream URL later.
+        try
+        {
+            MediaSource.LiveStreamId = UniqueId;
+        }
+        catch
+        {
+            // Best-effort: ignore if the property is not available.
+        }
+
+        // Constructor intentionally leaves out verbose mapping logs.
     }
 
     /// <inheritdoc />
@@ -109,35 +161,55 @@ public class Restream : ILiveStream, IDirectStreamProvider, IDisposable
         }
 
         string channelId = MediaSource.Id;
-        _logger.LogInformation("Starting restream for channel {ChannelId}.", channelId);
 
-        // Response stream is disposed manually.
-        HttpResponseMessage response = await _httpClientFactory.CreateClient(NamedClient.Default)
-            .GetAsync(_url, HttpCompletionOption.ResponseHeadersRead, openCancellationToken)
-            .ConfigureAwait(true);
-        _logger.LogDebug("Stream for channel {ChannelId} using url {Url}", channelId, _url);
-
-        // Handle a manual redirect in the case of a HTTPS to HTTP downgrade.
-        if (_redirects.Contains(response.StatusCode))
+        try
         {
-            _logger.LogDebug("Stream for channel {ChannelId} redirected to url {Url}", channelId, response.Headers.Location);
-            response = await _httpClientFactory.CreateClient(NamedClient.Default)
-                .GetAsync(response.Headers.Location, HttpCompletionOption.ResponseHeadersRead, openCancellationToken)
+            // Response stream is disposed manually.
+            HttpResponseMessage response = await _httpClientFactory.CreateClient(NamedClient.Default)
+                .GetAsync(_url, HttpCompletionOption.ResponseHeadersRead, openCancellationToken)
                 .ConfigureAwait(true);
-        }
+            // Handle a manual redirect in the case of a HTTPS to HTTP downgrade.
+            if (_redirects.Contains(response.StatusCode))
+            {
+                response = await _httpClientFactory.CreateClient(NamedClient.Default)
+                    .GetAsync(response.Headers.Location, HttpCompletionOption.ResponseHeadersRead, openCancellationToken)
+                    .ConfigureAwait(true);
+            }
 
-        _inputStream = await response.Content.ReadAsStreamAsync(CancellationToken.None).ConfigureAwait(false);
-        _copyTask = _inputStream.CopyToAsync(_buffer, _tokenSource.Token)
-            .ContinueWith(
-                (Task t) =>
-                {
-                    _logger.LogInformation("Restream for channel {ChannelId} finished with state {Status}", MediaSource.Id, t.Status);
-                    _inputStream.Close();
-                    _inputStream = null;
-                },
-                CancellationToken.None,
-                TaskContinuationOptions.None,
-                TaskScheduler.Default);
+            _inputStream = await response.Content.ReadAsStreamAsync(CancellationToken.None).ConfigureAwait(false);
+            _copyTask = _inputStream.CopyToAsync(_buffer, _tokenSource.Token)
+                .ContinueWith(
+                    (Task t) =>
+                    {
+                        if (t.IsFaulted)
+                        {
+                            _logger.LogError(t.Exception, "Restream for channel {ChannelId} finished with fault.", MediaSource.Id);
+                        }
+
+                        try
+                        {
+                            _inputStream?.Close();
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Error while closing input stream for channel {ChannelId}.", MediaSource.Id);
+                        }
+
+                        _inputStream = null;
+                    },
+                    CancellationToken.None,
+                    TaskContinuationOptions.None,
+                    TaskScheduler.Default);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to open restream for channel {ChannelId} using url {Url}.", channelId, _url);
+            throw;
+        }
     }
 
     /// <inheritdoc />
@@ -157,11 +229,9 @@ public class Restream : ILiveStream, IDirectStreamProvider, IDisposable
     {
         if (_inputStream == null)
         {
-            _logger.LogWarning("Restream for channel {ChannelId} was not opened.", MediaSource.Id);
             _ = Open(CancellationToken.None);
         }
 
-        _logger.LogInformation("Opening restream {Count} for channel {ChannelId}.", ConsumerCount, MediaSource.Id);
         return new WrappedBufferReadStream(_buffer);
     }
 

@@ -16,10 +16,12 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml.Linq;
 using Jellyfin.Xtream.Client;
 using Jellyfin.Xtream.Client.Models;
 using Jellyfin.Xtream.Service;
@@ -43,7 +45,8 @@ namespace Jellyfin.Xtream;
 /// <param name="logger">Instance of the <see cref="ILogger"/> interface.</param>
 /// <param name="memoryCache">Instance of the <see cref="IMemoryCache"/> interface.</param>
 /// <param name="xtreamClient">Instance of the <see cref="IXtreamClient"/> interface.</param>
-public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory httpClientFactory, ILogger<LiveTvService> logger, IMemoryCache memoryCache, IXtreamClient xtreamClient) : ILiveTvService, ISupportsDirectStreamProvider
+/// <param name="restreamManager">Instance of the <see cref="Jellyfin.Xtream.Service.RestreamManager"/> used to manage restream instances.</param>
+public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory httpClientFactory, ILogger<LiveTvService> logger, IMemoryCache memoryCache, IXtreamClient xtreamClient, Jellyfin.Xtream.Service.RestreamManager restreamManager) : ILiveTvService, ISupportsDirectStreamProvider
 {
     /// <inheritdoc />
     public string Name => "Xtream Live";
@@ -55,7 +58,7 @@ public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory ht
     public async Task<IEnumerable<ChannelInfo>> GetChannelsAsync(CancellationToken cancellationToken)
     {
         Plugin plugin = Plugin.Instance;
-        List<ChannelInfo> items = [];
+        List<ChannelInfo> items = new List<ChannelInfo>();
         foreach (StreamInfo channel in await plugin.StreamService.GetLiveStreamsWithOverrides(cancellationToken).ConfigureAwait(false))
         {
             ParsedName parsed = StreamService.ParseName(channel.Name);
@@ -124,7 +127,7 @@ public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory ht
     public async Task<List<MediaSourceInfo>> GetChannelStreamMediaSources(string channelId, CancellationToken cancellationToken)
     {
         MediaSourceInfo source = await GetChannelStream(channelId, string.Empty, cancellationToken).ConfigureAwait(false);
-        return [source];
+        return new List<MediaSourceInfo> { source };
     }
 
     /// <inheritdoc />
@@ -136,6 +139,12 @@ public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory ht
     /// <inheritdoc />
     public Task CloseLiveStream(string id, CancellationToken cancellationToken)
     {
+        // Reference parameters to satisfy analyzers that expect constructor-injected
+        // parameters to be used somewhere in the class. These no-op discards are
+        // harmless and avoid introducing fields that might trigger other warnings.
+        _ = appHost;
+        _ = httpClientFactory;
+
         logger.LogInformation("Closing livestream {ChannelId}", id);
         return Task.CompletedTask;
     }
@@ -173,23 +182,241 @@ public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory ht
         {
             items = new List<ProgramInfo>();
             Plugin plugin = Plugin.Instance;
+            logger.LogInformation(
+                "GetProgramsAsync for channel {ChannelId}, streamId {StreamId}. UseXmlTv: {UseXmlTv}, XmlTvUrl: '{XmlTvUrl}'",
+                channelId,
+                streamId,
+                plugin.Configuration.UseXmlTv,
+                plugin.Configuration.XmlTvUrl ?? "(default)");
+
+            if (plugin.Configuration.UseXmlTv)
             {
-                EpgListings epgs = await xtreamClient.GetEpgInfoAsync(plugin.Creds, streamId, cancellationToken).ConfigureAwait(false);
-                foreach (EpgInfo epg in epgs.Listings)
+                logger.LogInformation("Using XMLTV for EPG data (streamId: {StreamId})", streamId);
+
+                // Cache the live streams list to avoid repeated API calls
+                string streamsCacheKey = $"xtream-liveStreams-{plugin.DataVersion}";
+                if (!memoryCache.TryGetValue(streamsCacheKey, out IEnumerable<StreamInfo>? allStreams))
                 {
-                    items.Add(new()
+                    allStreams = await plugin.StreamService.GetLiveStreams(cancellationToken).ConfigureAwait(false);
+                    memoryCache.Set(streamsCacheKey, allStreams, TimeSpan.FromMinutes(plugin.Configuration.XmlTvCacheMinutes));
+                }
+
+                // Try to find the stream to get the EPG channel id
+                StreamInfo? streamInfo = allStreams?.FirstOrDefault(s => s.StreamId == streamId);
+                if (streamInfo != null && allStreams != null)
+                {
+                    // Build channel mapping
+                    var channelMapping = XmlTvValidation.BuildChannelMapping(allStreams);
+
+                    string xmlCacheKey = $"xtream-xmltv-{plugin.DataVersion}";
+                    if (!memoryCache.TryGetValue(xmlCacheKey, out Dictionary<string, List<(DateTime Start, DateTime End, string Title, string Description)>>? mapping))
                     {
-                        Id = StreamService.ToGuid(StreamService.EpgPrefix, streamId, epg.Id, 0).ToString(),
-                        ChannelId = channelId,
-                        StartDate = epg.Start,
-                        EndDate = epg.End,
-                        Name = epg.Title,
-                        Overview = epg.Description,
-                    });
+                        mapping = new Dictionary<string, List<(DateTime Start, DateTime End, string Title, string Description)>>();
+                        try
+                        {
+                            string xml;
+                            string diskCachePath = XmlTvValidation.GetCachePath(plugin.Configuration.XmlTvCachePath);
+
+                            // Try disk cache first if enabled
+                            if (plugin.Configuration.XmlTvDiskCache && File.Exists(diskCachePath))
+                            {
+                                xml = await File.ReadAllTextAsync(diskCachePath, cancellationToken).ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                xml = await xtreamClient.GetXmlTvAsync(plugin.Creds, plugin.Configuration.XmlTvUrl, cancellationToken).ConfigureAwait(false);
+
+                                // Write to disk cache if enabled
+                                if (plugin.Configuration.XmlTvDiskCache)
+                                {
+                                    await File.WriteAllTextAsync(diskCachePath, xml, cancellationToken).ConfigureAwait(false);
+                                }
+                            }
+
+                            // Validate XMLTV content
+                            int requiredDays = plugin.Configuration.XmlTvHistoricalDays;
+                            if (requiredDays <= 0)
+                            {
+                                requiredDays = allStreams.Where(s => s.TvArchive).Select(s => s.TvArchiveDuration).DefaultIfEmpty(7).Max();
+                            }
+
+                            if (!XmlTvValidation.ValidateXmlTv(xml, requiredDays, logger))
+                            {
+                                throw new InvalidDataException("XMLTV content validation failed - check logs for details");
+                            }
+
+                            var doc = XDocument.Parse(xml);
+                            var programmes = doc.Descendants("programme");
+
+                            foreach (var prog in programmes)
+                            {
+                                string? ch = prog.Attribute("channel")?.Value;
+                                if (string.IsNullOrEmpty(ch))
+                                {
+                                    continue; // Skip programmes without channel ID
+                                }
+
+                                string? startRaw = prog.Attribute("start")?.Value;
+                                string? stopRaw = prog.Attribute("stop")?.Value;
+
+                                if (string.IsNullOrEmpty(startRaw) || string.IsNullOrEmpty(stopRaw))
+                                {
+                                    continue; // Skip programmes without valid time range
+                                }
+
+                                DateTime start;
+                                DateTime stop;
+
+                                // Local helper to parse XMLTV date/time formats used by providers (handles timezone like +0000 -> +00:00)
+                                static DateTime ParseXmlTvDate(string raw)
+                                {
+                                    if (string.IsNullOrWhiteSpace(raw))
+                                    {
+                                        return DateTime.MinValue;
+                                    }
+
+                                    string s = raw.Replace(" ", string.Empty, StringComparison.Ordinal);
+                                    // If timezone is in form +0000 convert to +00:00 for parsing with 'zzz'
+                                    if (s.Length > 14)
+                                    {
+                                        string zone = s[^5..];
+                                        if ((zone[0] == '+' || zone[0] == '-') && int.TryParse(zone[1..], out _))
+                                        {
+                                            string zoneWithColon = zone.Insert(3, ":");
+                                            s = s[..^5] + zoneWithColon;
+                                        }
+                                    }
+
+                                    if (DateTime.TryParseExact(s, "yyyyMMddHHmmsszzz", CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var dt))
+                                    {
+                                        return dt.ToUniversalTime();
+                                    }
+
+                                    // Fallback
+                                    return DateTime.Parse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+                                }
+
+                                try
+                                {
+                                    start = ParseXmlTvDate(startRaw);
+                                    stop = ParseXmlTvDate(stopRaw);
+
+                                    if (start == DateTime.MinValue || stop == DateTime.MinValue || start >= stop)
+                                    {
+                                        continue; // Skip programmes with invalid dates
+                                    }
+                                }
+                                catch
+                                {
+                                    continue; // Skip programmes with unparseable dates
+                                }
+
+                                string title = prog.Element("title")?.Value ?? string.Empty;
+                                string desc = prog.Element("desc")?.Value ?? string.Empty;
+
+                                if (!mapping.TryGetValue(ch, out var list))
+                                {
+                                    list = new List<(DateTime Start, DateTime End, string Title, string Description)>();
+                                    mapping[ch] = list;
+                                }
+
+                                list.Add((Start: start, End: stop, Title: title, Description: desc));
+                            }
+
+                            memoryCache.Set(xmlCacheKey, mapping, DateTimeOffset.Now.AddMinutes(plugin.Configuration.XmlTvCacheMinutes));
+                        }
+                        catch (HttpRequestException ex)
+                        {
+                            logger.LogError(
+                                ex,
+                                "Failed to download XMLTV feed from {Url}. Status: {StatusCode}",
+                                plugin.Configuration.XmlTvUrl ?? "default",
+                                ex.StatusCode);
+                            mapping = new Dictionary<string, List<(DateTime, DateTime, string, string)>>();
+                        }
+                        catch (Exception ex) when (ex is System.Xml.XmlException || ex is InvalidDataException)
+                        {
+                            logger.LogError(ex, "Failed to parse XMLTV feed. The XML data may be invalid or corrupted");
+                            mapping = new Dictionary<string, List<(DateTime, DateTime, string, string)>>();
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, "Unexpected error processing XMLTV feed");
+                            mapping = new Dictionary<string, List<(DateTime, DateTime, string, string)>>();
+                        }
+                    }
+
+                    // Find all possible EPG keys for this stream
+                    foreach (var kvp in channelMapping)
+                    {
+                        if (kvp.Value != null && mapping != null &&
+                            kvp.Value.Contains(streamId) &&
+                            mapping.TryGetValue(kvp.Key, out var progsForChannel) &&
+                            progsForChannel != null)
+                        {
+                            int localId = 1;
+                            foreach (var p in progsForChannel)
+                            {
+                                items.Add(new()
+                                {
+                                    Id = StreamService.ToGuid(StreamService.EpgPrefix, streamId, localId++, 0).ToString(),
+                                    ChannelId = channelId,
+                                    StartDate = p.Start,
+                                    EndDate = p.End,
+                                    Name = p.Title,
+                                    Overview = p.Description,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                logger.LogDebug("Using per-channel EPG API for streamId: {StreamId}", streamId);
+                try
+                {
+                    EpgListings epgs = await xtreamClient.GetEpgInfoAsync(plugin.Creds, streamId, cancellationToken).ConfigureAwait(false);
+
+                    if (epgs?.Listings == null)
+                    {
+                        logger.LogWarning("No EPG data returned for streamId: {StreamId}", streamId);
+                        memoryCache.Set(key, items, DateTimeOffset.Now.AddMinutes(30));
+                        return items;
+                    }
+
+                    foreach (EpgInfo epg in epgs.Listings)
+                    {
+                        items.Add(new()
+                        {
+                            Id = StreamService.ToGuid(StreamService.EpgPrefix, streamId, epg.Id, 0).ToString(),
+                            ChannelId = channelId,
+                            StartDate = epg.Start,
+                            EndDate = epg.End,
+                            Name = epg.Title,
+                            Overview = epg.Description,
+                        });
+                    }
+                }
+                catch (HttpRequestException ex)
+                {
+                    logger.LogError(
+                        ex,
+                        "Failed to fetch per-channel EPG for streamId {StreamId}. Status: {StatusCode}",
+                        streamId,
+                        ex.StatusCode);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Unexpected error fetching EPG for streamId {StreamId}", streamId);
                 }
             }
 
-            memoryCache.Set(key, items, DateTimeOffset.Now.AddMinutes(10));
+            // Cache the results
+            if (items.Count > 0)
+            {
+                memoryCache.Set(key, items, DateTimeOffset.Now.AddMinutes(30));
+            }
         }
 
         return from epg in items
@@ -214,13 +441,34 @@ public class LiveTvService(IServerApplicationHost appHost, IHttpClientFactory ht
         }
 
         Plugin plugin = Plugin.Instance;
+        logger.LogInformation("GetChannelStreamWithDirectStreamProvider: channelId={ChannelId} streamId={StreamId}", channelId, streamId);
+
         MediaSourceInfo mediaSourceInfo = plugin.StreamService.GetMediaSourceInfo(StreamType.Live, channel, restream: true);
-        ILiveStream? stream = currentLiveStreams.Find(stream => stream.TunerHostId == Restream.TunerHost && stream.MediaSource.Id == mediaSourceInfo.Id);
+
+        // Ask RestreamManager for the canonical restream instance for this MediaSource.
+        Restream restream = restreamManager.GetOrCreateRestream(mediaSourceInfo);
+
+        ILiveStream? stream = currentLiveStreams.Find(s => s.TunerHostId == Restream.TunerHost && s.MediaSource.Id == mediaSourceInfo.Id);
 
         if (stream == null)
         {
-            stream = new Restream(appHost, httpClientFactory, logger, mediaSourceInfo);
-            await stream.Open(cancellationToken).ConfigureAwait(false);
+            // Ensure the restream has an active upstream connection. GetOrCreateRestream
+            // already schedules open attempts and performs a short synchronous open,
+            // but callers may want to await an open here to minimize races.
+            try
+            {
+                await restream.Open(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                logger.LogWarning("Opening restream was cancelled for channel {ChannelId}", mediaSourceInfo.Id);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to open restream for channel {ChannelId}", mediaSourceInfo.Id);
+            }
+
+            stream = restream;
         }
 
         stream.ConsumerCount++;
